@@ -8,8 +8,10 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi[standard]>=0.162.0",
     "httpx>=0.28.1",
     "pydantic>=2.14.1",
+    "structlog>=26.1.0",
 ]
 
 [build-system]
