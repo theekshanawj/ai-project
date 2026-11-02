@@ -1,79 +1,92 @@
 import asyncio
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
-from typing import Annotated, Protocol
 
 import httpx
 import structlog
-from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, status
+from pydantic import AwareDatetime
 
-from project.fetch import Release, fetch_latest
-from project.logging_setup import configure_logging
+from project.config.logging_setup import configure_logging
+from project.models import (
+    PollResult,
+    RepoName,
+    StoredRelease,
+    WatchRequest,
+    WatchResponse,
+)
+from project.poller import poll_forever, poll_once
+from project.settings import Settings
+from project.sources import make_source
+from project.store import get_store
 
 configure_logging()
 log = structlog.get_logger()
 
 
-class ReleaseSource(Protocol):
-    async def latest(self, repo: str) -> Release: ...
-
-
-class GitHubSource:
-    def __init__(self, client: httpx.AsyncClient) -> None:
-        self._client = client
-
-    async def latest(self, repo: str) -> Release:
-        return await fetch_latest(self._client, repo)
-
-
-class FakeSource:
-    async def latest(self, repo: str) -> Release:
-        await asyncio.sleep(0.2)
-        return Release(
-            tag_name="v1.0.0", published_at=datetime.now(UTC), name=repo, repo=repo
-        )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    async with httpx.AsyncClient(timeout=10) as client:
-        app.state.client = client
+    settings = Settings()
+    headers = {}
+    if settings.github_token:
+        headers["Authorization"] = f"Bearer {settings.github_token.get_secret_value()}"
+
+    # Exits run in reverse: the poller stops first, then the client, then the DB.
+    async with (
+        get_store(settings.store_type, settings.db_path) as store,
+        httpx.AsyncClient(timeout=10, headers=headers) as client,
+        asyncio.TaskGroup() as tg,
+    ):
+        app.state.store = store
+        app.state.source = make_source(settings, client)
+        poller = tg.create_task(
+            poll_forever(
+                app.state.store, app.state.source, settings.poll_interval_seconds
+            )
+        )
         yield
+        poller.cancel()  # otherwise the TaskGroup waits forever on shutdown
 
 
 app = FastAPI(title="Release API", lifespan=lifespan)
 
 
-def get_source(request: Request) -> ReleaseSource:
-    if os.environ.get("RELEASE_SOURCE") == "github":
-        log.info("Using real github")
-        return GitHubSource(request.app.state.client)
-    log.info("Using fake")
-    return FakeSource()
-
-
-Source = Annotated[ReleaseSource, Depends(get_source)]
-
-
-class BatchRequest(BaseModel):
-    repos: list[str] = Field(min_length=1, max_length=20)
-
-
-@app.get("/releases/{owner}/{repo}")
-async def latest_release(owner: str, repo: str, source: Source) -> Release:
+@app.post("/watchlist", status_code=status.HTTP_201_CREATED)
+async def add_to_watchlist(req: WatchRequest) -> WatchResponse:
     try:
-        return await source.latest(f"{owner}/{repo}")
-    except httpx.HTTPStatusError as e:
+        added = await app.state.store.add_repo(req.repo)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    if not added:
         raise HTTPException(
-            status_code=502, detail=f"upstream returned {e.response.status_code}"
-        ) from e
+            status_code=status.HTTP_409_CONFLICT, detail="Repository already watched"
+        )
+    return WatchResponse(status="success")
 
 
-@app.post("/releases/batch")
-async def batch(req: BatchRequest, source: Source) -> list[Release]:
-    async with asyncio.TaskGroup() as tg:
-        tasks = [tg.create_task(source.latest(r)) for r in req.repos]
-    return [t.result() for t in tasks]
+@app.get("/watchlist")
+async def get_watchlist() -> list[str]:
+    return await app.state.store.list_repos()
+
+
+# {repo:path} so the "/" in "owner/name" is captured instead of ending the route.
+@app.delete("/watchlist/{repo:path}")
+async def remove_from_watchlist(repo: RepoName) -> WatchResponse:
+    removed = await app.state.store.remove_repo(repo)
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Repository not found"
+        )
+    return WatchResponse(status="success")
+
+
+@app.get("/releases")
+async def get_releases(since: AwareDatetime) -> list[StoredRelease]:
+    releases = await app.state.store.releases_since(since)
+    return releases[::-1]  # store keeps oldest first; API returns newest first
+
+
+@app.post("/poll")
+async def poll() -> PollResult:
+    """Poll all watched repos now, without waiting for the next scheduled round."""
+    return await poll_once(app.state.store, app.state.source)

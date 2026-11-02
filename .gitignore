@@ -10,3 +10,6 @@ wheels/
 .venv
 
 notes
+# Local settings / secrets
+.env
+*.db
